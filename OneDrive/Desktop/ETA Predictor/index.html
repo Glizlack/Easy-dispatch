@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Professional ETA Predictor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 flex items-center justify-center min-h-screen p-4">
+  <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-md">
+    <h1 class="text-2xl font-bold text-center mb-6 text-blue-600">ETA Predictor</h1>
+
+    <div class="space-y-4">
+      <div>
+        <label class="block text-sm font-medium text-gray-700">Total Distance (Miles)</label>
+        <input
+          type="number"
+          id="distance"
+          value="550"
+          min="0.1"
+          step="0.1"
+          class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border focus:ring-blue-500 focus:border-blue-500"
+        />
+      </div>
+
+      <div>
+        <div class="flex justify-between">
+          <label class="block text-sm font-medium text-gray-700">Average Speed (mph)</label>
+          <span id="speedValue" class="text-sm font-bold text-blue-600">50 mph</span>
+        </div>
+        <input
+          type="range"
+          id="speedRange"
+          min="30"
+          max="80"
+          value="50"
+          step="1"
+          class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer mt-2"
+        />
+      </div>
+
+      <div>
+        <label class="block text-sm font-medium text-gray-700">Start Date & Time</label>
+        <input
+          type="datetime-local"
+          id="startDateTime"
+          class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+        />
+      </div>
+
+      <div>
+        <label class="block text-sm font-medium text-gray-700">Shift Remaining (Hours Left)</label>
+        <input
+          type="number"
+          id="hoursLeft"
+          value="14"
+          min="0"
+          max="14"
+          step="0.1"
+          class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border"
+        />
+        <p class="text-xs text-gray-500 mt-1">Full shift is 14.0 hours.</p>
+      </div>
+
+      <div class="flex items-center pt-2">
+        <input
+          id="use11HourRule"
+          type="checkbox"
+          class="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 rounded focus:ring-blue-500"
+          checked
+        />
+        <label for="use11HourRule" class="ml-2 text-sm font-medium text-gray-900">
+          Use 11-Hour Driving Rule
+        </label>
+      </div>
+      <p class="text-xs text-gray-500 -mt-2">Uncheck for custom 10.5 hour driving limit.</p>
+
+      <button
+        id="calcBtn"
+        class="w-full bg-blue-600 text-white py-3 px-4 rounded-md font-bold hover:bg-blue-700 transition shadow-md"
+      >
+        Calculate ETA
+      </button>
+    </div>
+
+    <div id="result" class="mt-6 hidden animate-fade-in">
+      <div class="bg-green-50 border-l-4 border-green-500 rounded-r-md p-4 mb-4">
+        <p class="text-sm text-green-800 font-bold uppercase tracking-wider">Predicted ETA:</p>
+        <p id="etaDisplay" class="text-xl font-black text-green-900"></p>
+      </div>
+
+      <div class="bg-blue-50 border-l-4 border-blue-500 rounded-r-md p-4">
+        <p class="text-sm text-blue-800 font-bold uppercase tracking-wider">Compliance Log:</p>
+        <ul id="logs" class="list-disc list-inside text-xs text-gray-700 mt-2 space-y-1"></ul>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const THRESHOLD = 0.001; // For float precision
+
+    window.addEventListener("load", () => {
+      // Set default time to "Now"
+      const now = new Date();
+      now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+      document.getElementById("startDateTime").value = now.toISOString().slice(0, 16);
+
+      // UI Slider Update
+      const speedRange = document.getElementById("speedRange");
+      const speedValue = document.getElementById("speedValue");
+      speedRange.addEventListener("input", () => {
+        speedValue.innerText = `${speedRange.value} mph`;
+      });
+
+      document.getElementById("calcBtn").addEventListener("click", calculateETA);
+    });
+
+    function calculateETA() {
+      // 1. Gather Inputs
+      const speed = parseFloat(document.getElementById("speedRange").value);
+      const useStandardRule = document.getElementById("use11HourRule").checked;
+      const distance = parseFloat(document.getElementById("distance").value);
+      const dateTimeStr = document.getElementById("startDateTime").value;
+      const hoursLeftInput = parseFloat(document.getElementById("hoursLeft").value);
+
+      // 2. Validation
+      if (!dateTimeStr) return alert("Please select a start date and time.");
+      if (isNaN(distance) || distance <= 0) return alert("Please enter a valid distance.");
+      if (isNaN(hoursLeftInput) || hoursLeftInput < 0 || hoursLeftInput > 14) {
+        return alert("Shift remaining must be between 0 and 14 hours.");
+      }
+
+      // 3. Configuration (FMCSA OTR Standards)
+      const maxDrive = useStandardRule ? 11.0 : 10.5;
+      const maxDuty = 14.0;
+      const breakTrigger = 8.0; // Drive 8 hours, then take break
+      const inspectionTime = 0.25; // 15 mins
+      const breakTime = 0.5; // 30 mins
+      const sleepTime = 10.0; // 10 hours
+
+      // 4. Initial State
+      let currentDate = new Date(dateTimeStr);
+      let milesLeft = distance;
+      let dutyClock = hoursLeftInput;
+      let driveClock = Math.min(maxDrive, dutyClock);
+      let driveSinceBreak = 0;
+      
+      // Recommended Smart Logic: PTI always at trip start
+      let needsPreTrip = true;
+      
+      const logs = [];
+      logs.push(`Starting Trip: ${distance} miles @ ${speed} mph.`);
+      logs.push(`Rule: ${maxDrive}h Drive / 14h Duty.`);
+
+      let safetyLoop = 0;
+
+      while (milesLeft > THRESHOLD) {
+        if (safetyLoop++ > 5000) break;
+
+        // A) Pre-Trip Inspection
+        if (needsPreTrip) {
+          logs.push("Pre-Trip Inspection (15 min)");
+          currentDate.setMinutes(currentDate.getMinutes() + (inspectionTime * 60));
+          dutyClock -= inspectionTime;
+          driveClock = Math.min(maxDrive, dutyClock); // Sync drive clock with duty
+          needsPreTrip = false;
+        }
+
+        // B) Check for Daily Limits (Drive or Duty exhausted)
+        if (driveClock <= THRESHOLD || dutyClock <= THRESHOLD) {
+          logs.push(`End of Day: ${driveClock <= THRESHOLD ? 'Drive' : 'Duty'} limit hit.`);
+          
+          // Post-Trip before sleep
+          logs.push("Post-Trip Inspection (15 min)");
+          currentDate.setMinutes(currentDate.getMinutes() + (inspectionTime * 60));
+          dutyClock -= inspectionTime;
+          
+          // 10-Hour Sleep
+          logs.push("Sleeper Berth (10 Hours)");
+          currentDate.setHours(currentDate.getHours() + sleepTime);
+          
+          // RESET CLOCKS
+          dutyClock = maxDuty;
+          driveClock = maxDrive;
+          driveSinceBreak = 0;
+          needsPreTrip = true; // Always PTI after a sleep reset
+          continue;
+        }
+
+        // C) 30-Minute Break (Required after 8 hours driving)
+        if (driveSinceBreak >= breakTrigger) {
+          logs.push("Mandatory 30-Minute Rest Break");
+          currentDate.setMinutes(currentDate.getMinutes() + (breakTime * 60));
+          dutyClock -= breakTime; // 14-hour clock keeps ticking
+          driveSinceBreak = 0;
+          continue;
+        }
+
+        // D) Calculation of the next "Drive Leg"
+        // We drive until the first of: Destination, Drive Limit, Duty Limit, or 8-hour Break
+        let timeToDestination = milesLeft / speed;
+        let timeToBreak = breakTrigger - driveSinceBreak;
+
+        let driveLeg = Math.min(
+          timeToDestination,
+          driveClock,
+          dutyClock,
+          timeToBreak
+        );
+
+        // Execute the leg
+        currentDate.setMinutes(currentDate.getMinutes() + (driveLeg * 60));
+        milesLeft -= (driveLeg * speed);
+        driveClock -= driveLeg;
+        dutyClock -= driveLeg;
+        driveSinceBreak += driveLeg;
+      }
+
+      // E) Final Post-Trip at Destination
+      logs.push("Arrived at Destination");
+      logs.push("Final Post-Trip Inspection (15 min)");
+      currentDate.setMinutes(currentDate.getMinutes() + (inspectionTime * 60));
+      dutyClock -= inspectionTime;
+
+      // 5. Output to UI
+      const resultDiv = document.getElementById("result");
+      const etaDisplay = document.getElementById("etaDisplay");
+      const logList = document.getElementById("logs");
+
+      resultDiv.classList.remove("hidden");
+      
+      const options = { 
+        weekday: 'long', year: 'numeric', month: 'long', 
+        day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false 
+      };
+      etaDisplay.innerText = currentDate.toLocaleString('en-US', options);
+
+      logList.innerHTML = "";
+      logs.forEach(msg => {
+        const li = document.createElement("li");
+        li.innerText = msg;
+        logList.appendChild(li);
+      });
+    }
+  </script>
+</body>
+</html>
